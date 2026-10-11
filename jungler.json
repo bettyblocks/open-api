@@ -1,1504 +1,3175 @@
-openapi: 3.0.3
-info:
-  title: Jungler API
-  version: "1.0.0"
-  description: |
-    De Jungler API geeft programmatische toegang tot data die door je signals (saved searches)
-    en workbooks is verzameld: workspaces, signals, posts, engagers (comments/reactions),
-    contacts en hulptools.
-
-    **Authenticatie** — elke request vereist een API key in de header `X-API-Key`.
-    Een key maak je aan in Jungler via *Settings → API Keys* (wordt maar één keer getoond).
-
-    **Formaten**
-    - Alle responses zijn JSON. Fouten hebben de vorm `{"detail": "..."}`; sommige endpoints
-      geven een gestructureerd object in `detail` (bijv. 409 Conflict).
-    - Timestamps zijn ISO 8601 in UTC (`2024-01-15T10:30:00Z`); datumfilters accepteren ook `2024-01-15`.
-    - Resource-ID's zijn MongoDB ObjectIds (24 hex-tekens).
-
-    **Rate limiting** — per endpoint en per API key (zie `x-rate-limit` per operatie).
-    Bij overschrijding volgt `429 Too Many Requests`; gebruik exponential backoff.
-
-    **Data retention** — posts en engagers worden 180 dagen bewaard (op basis van `posted_at`).
-    Workbook-data verloopt 12 uur na aanmaak/dispatch.
-
-    Bron: https://docs.jungler.ai/api
-  contact:
-    name: Jungler support
-    email: team@jungler.ai
-    url: https://docs.jungler.ai/api
-servers:
-  - url: https://production.viacurrent.com/api
-    description: Production
-security:
-  - ApiKeyAuth: []
-tags:
-  - name: Workspaces
-    description: Workspaces waar je toegang toe hebt en hun abonnement.
-  - name: Signals
-    description: Aanmaken, beheren en monitoren van signals (saved searches).
-  - name: Posts
-    description: Ophalen en filteren van posts die door signals zijn verzameld.
-  - name: Engagers
-    description: Interacties (comments, reactions) en gededupliceerde contacts uit signals en workbooks.
-  - name: Workbooks
-    description: Tijdelijke workbooks die interacties van één post extraheren, direct of gepland.
-  - name: Tools
-    description: Hulpendpoints voor het parsen van URL's en namen.
-
-paths:
-  /workspaces:
-    get:
-      tags: [Workspaces]
-      operationId: listWorkspaces
-      summary: List workspaces
-      description: Alle workspaces van de geauthenticeerde gebruiker, inclusief lidmaatschapsinformatie.
-      x-rate-limit: 30/minute
-      responses:
-        "200":
-          description: Lijst met workspace-lidmaatschappen.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/WorkspaceMembership" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /workspaces/{workspace_id}/subscription:
-    get:
-      tags: [Workspaces]
-      operationId: getWorkspaceSubscription
-      summary: Get workspace subscription
-      description: Abonnement- en creditgebruik van een workspace.
-      x-rate-limit: 30/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkspaceIdPath"
-      responses:
-        "200":
-          description: Abonnementsinformatie.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Subscription" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403":
-          description: Geen lid van deze workspace.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { detail: "Not a member of this workspace" }
-        "404":
-          description: Geen actief abonnement.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { detail: "no_active_subscription" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /signals:
-    get:
-      tags: [Signals]
-      operationId: listSignals
-      summary: List signals
-      description: Signals in een workspace. Velden met waarde `null` worden weggelaten.
-      x-rate-limit: 30/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - name: query_type
-          in: query
-          description: Filter op type signal. Zonder filter worden alle types teruggegeven.
-          schema: { $ref: "#/components/schemas/QueryType" }
-        - name: is_activated
-          in: query
-          description: Filter op activatiestatus. Zonder filter zowel actief als inactief.
-          schema: { type: boolean }
-      responses:
-        "200":
-          description: Lijst met signals.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Signal" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-    post:
-      tags: [Signals]
-      operationId: createSignal
-      summary: Create signal
-      description: |
-        Maakt een nieuwe signal aan. **De eerste run start automatisch**; daarna draait de signal
-        ongeveer elke 24 uur. Er is geen endpoint om handmatig extra runs te starten.
-
-        Het type (`query_type`) wordt automatisch afgeleid uit `query`:
-        keywords → `search_keyword`, profiel-URL → `user_profile`, bedrijfs-URL → `company_profile`.
-
-        Voor `user_profile`/`company_profile` wordt het profiel synchroon gevalideerd en verrijkt;
-        de request kan dan **5-15 seconden** duren.
-      x-rate-limit: 6/minute
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateSignalRequest" }
-            examples:
-              keyword:
-                summary: Keyword signal
-                value:
-                  workspace_id: "507f1f77bcf86cd799439013"
-                  name: "Brand Mentions"
-                  query: "lemlist OR \"heyreach\""
-                  prompt: "Only mark relevant the posts that explicitly mention lemlist or HeyReach, the outreach tools"
-                  webhook_url: "https://customer.com/callback"
-              profile:
-                summary: Profile signal
-                value:
-                  workspace_id: "507f1f77bcf86cd799439013"
-                  name: "Follow Specific Person"
-                  query: "https://linkedin.com/in/vearnold"
-                  initial_window: past_week
-                  engagement_type: COMMENT
-              company:
-                summary: Company signal
-                value:
-                  workspace_id: "507f1f77bcf86cd799439013"
-                  name: "Company Posts"
-                  query: "https://linkedin.com/company/example-corp"
-                  track_engagement: false
-      responses:
-        "201":
-          description: Signal aangemaakt, inclusief info over de eerste run.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/CreatedSignal" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403":
-          description: Signal-limiet van de workspace bereikt, of geen toegang.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { detail: "workspace_signal_limit_reached" }
-        "422": { $ref: "#/components/responses/ValidationError" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-      callbacks:
-        runCompleted:
-          "{$request.body#/webhook_url}":
-            post:
-              summary: Signal run completion callback
-              description: |
-                Wordt verstuurd na elke voltooide run (ook de automatische eerste run en alle
-                geplande runs). Bevat geen posts of engagers; haal die op via de Posts/Engagers API.
-                Timeout 5 seconden, 1 retry na 30 seconden. URL moet HTTPS zijn.
-              requestBody:
-                required: true
-                content:
-                  application/json:
-                    schema: { $ref: "#/components/schemas/SignalRun" }
-              responses:
-                "2XX":
-                  description: Callback ontvangen.
-
-  /signals/{signal_id}:
-    parameters:
-      - $ref: "#/components/parameters/SignalIdPath"
-    get:
-      tags: [Signals]
-      operationId: getSignal
-      summary: Get signal
-      x-rate-limit: 60/minute
-      responses:
-        "200":
-          description: De signal.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Signal" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "404": { $ref: "#/components/responses/SignalNotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-    delete:
-      tags: [Signals]
-      operationId: deleteSignal
-      summary: Delete signal
-      description: Verwijdert een signal permanent. Verzamelde posts en engagers blijven beschikbaar.
-      x-rate-limit: 6/minute
-      responses:
-        "204":
-          description: Verwijderd (lege body).
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "404": { $ref: "#/components/responses/SignalNotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /signals/{signal_id}/run:
-    get:
-      tags: [Signals]
-      operationId: getSignalRunStatus
-      summary: Get latest run status
-      description: |
-        Status van de laatste run van een signal. Poll elke 10-30 seconden; de meeste runs zijn
-        binnen 2-5 minuten klaar. Terminale statussen: `success`, `success_with_warnings`,
-        `failed`, `timed_out`, `cancelled`.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/SignalIdPath"
-      responses:
-        "200":
-          description: Run-status.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/SignalRun" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "404":
-          description: Signal bestaat niet of heeft nog nooit gedraaid.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /signals/{signal_id}/activate:
-    put:
-      tags: [Signals]
-      operationId: activateSignal
-      summary: Activate signal
-      description: Heractiveert een gepauzeerde signal; hij draait weer volgens schema.
-      x-rate-limit: 6/minute
-      parameters:
-        - $ref: "#/components/parameters/SignalIdPath"
-      responses:
-        "200":
-          description: "Bijgewerkte signal met `is_activated: true`."
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Signal" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "404": { $ref: "#/components/responses/SignalNotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /signals/{signal_id}/deactivate:
-    put:
-      tags: [Signals]
-      operationId: deactivateSignal
-      summary: Deactivate signal
-      description: Pauzeert een signal. Signal en verzamelde data blijven toegankelijk.
-      x-rate-limit: 6/minute
-      parameters:
-        - $ref: "#/components/parameters/SignalIdPath"
-      responses:
-        "200":
-          description: "Bijgewerkte signal met `is_activated: false`."
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Signal" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "404": { $ref: "#/components/responses/SignalNotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /posts:
-    get:
-      tags: [Posts]
-      operationId: listPosts
-      summary: List posts
-      description: |
-        Gepagineerde lijst van posts met uitgebreide filters.
-
-        **Datumvelden:** `posted_at` = publicatiemoment online; `created_at` = moment waarop Jungler
-        de post vastlegde. Gebruik per request óf `posted_*` óf `created_*` filters — combineren
-        wordt geweigerd. Een datumbereik mag maximaal 180 dagen beslaan, en `*_after` moet strikt
-        vóór `*_before` liggen.
-
-        **Paginatie:** doe de eerste request zonder `snapshot_time`, en hergebruik de teruggegeven
-        `snapshot_time` voor volgende pagina's.
-
-        **Incrementele engagement-sync:** gebruik `has_engagement_since` met de hoogste
-        `last_engagement_at` van je vorige sync, en haal per post de nieuwe engagers op via
-        `GET /engagers/post/{post_id}?captured_after=...`.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - name: signal_ids
-          in: query
-          required: true
-          description: Komma-gescheiden lijst van signal-ID's.
-          schema: { type: string }
-          example: "507f1f77bcf86cd799439012,507f1f77bcf86cd799439014"
-        - $ref: "#/components/parameters/Page"
-        - name: page_size
-          in: query
-          description: Items per pagina.
-          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-        - $ref: "#/components/parameters/SnapshotTime"
-        - name: sort_by
-          in: query
-          description: Sorteerveld. Als `has_engagement_since` is gezet zonder `sort_by`, wordt gesorteerd op `last_engagement_at` aflopend.
-          schema: { type: string, enum: [posted_at, created_at, weight], default: posted_at }
-        - name: sort_direction
-          in: query
-          schema: { type: string, enum: [asc, desc], default: desc }
-        - name: match
-          in: query
-          description: "AI-relevantieclassificatie, komma-gescheiden: `relevant`, `not_relevant`, `unclassified`. Werkt alleen als AI-filtering voor de signals is ingesteld."
-          schema: { type: string }
-        - name: type
-          in: query
-          description: "Posttypes, komma-gescheiden: `buying_intent`, `hiring`, `thought_leadership`, `lead_magnet`, `promotion`, `announcement`, `other`."
-          schema: { type: string }
-        - name: sentiment
-          in: query
-          description: "Sentiment, komma-gescheiden: `positive`, `negative`, `neutral`."
-          schema: { type: string }
-        - name: author
-          in: query
-          description: Komma-gescheiden auteurtypes.
-          schema: { type: string }
-        - name: lang
-          in: query
-          description: Komma-gescheiden taalcodes (bijv. `en`, `es`, `fr`, `de`).
-          schema: { type: string }
-        - name: created_after
-          in: query
-          description: Inclusieve ondergrens (UTC) voor het moment waarop Jungler de post vastlegde.
-          schema: { type: string }
-          example: "2024-01-15"
-        - name: created_before
-          in: query
-          description: Inclusieve bovengrens (UTC) voor het moment waarop Jungler de post vastlegde.
-          schema: { type: string }
-        - name: posted_after
-          in: query
-          description: Inclusieve ondergrens (UTC) voor het publicatiemoment.
-          schema: { type: string }
-        - name: posted_before
-          in: query
-          description: Inclusieve bovengrens (UTC) voor het publicatiemoment.
-          schema: { type: string }
-        - name: has_engagement_since
-          in: query
-          description: Exclusieve ondergrens (UTC). Alleen posts die strikt ná dit moment een nieuw vastgelegde comment of reaction kregen.
-          schema: { type: string, format: date-time }
-        - name: country
-          in: query
-          description: Komma-gescheiden ISO-landcodes om op te nemen.
-          schema: { type: string }
-        - name: country_exclude
-          in: query
-          description: Komma-gescheiden ISO-landcodes om uit te sluiten.
-          schema: { type: string }
-        - name: function
-          in: query
-          description: "Komma-gescheiden functiecodes: `ENG`, `PRD`, `MKT`, `SAL`, `FIN`, `OPS`, `HR`, `CS`, `LEG`, `DA`, `DSN`, `EDU`, `AMB`, `GEN`, `UNMAPPED`."
-          schema: { type: string }
-        - name: function_exclude
-          in: query
-          description: Functiecodes om uit te sluiten (zelfde waarden als `function`).
-          schema: { type: string }
-        - name: role_level
-          in: query
-          description: "Authority, komma-gescheiden: `executive`, `vp`, `director`, `manager`, `principal`, `senior_ic`, `ic`, `junior`, `unranked`, `UNMAPPED`. (`out_of_scope` komt voor in responses maar is geen filterwaarde.)"
-          schema: { type: string }
-        - name: role_level_exclude
-          in: query
-          description: Authority-niveaus om uit te sluiten.
-          schema: { type: string }
-        - name: employment_context
-          in: query
-          description: "Komma-gescheiden: `in_house`, `founder_owner`, `fractional`, `interim`, `advisory`, `freelance`, `UNMAPPED`."
-          schema: { type: string }
-        - name: employment_context_exclude
-          in: query
-          description: Employment contexts om uit te sluiten.
-          schema: { type: string }
-        - name: company_size
-          in: query
-          description: "Komma-gescheiden: `XXS` (1-10), `XS` (11-50), `S` (51-200), `M` (201-500), `L` (501-1000), `XL` (1001-5000), `XXL` (5001+), `UNMAPPED`."
-          schema: { type: string }
-        - name: company_size_exclude
-          in: query
-          description: Bedrijfsgroottes om uit te sluiten.
-          schema: { type: string }
-        - name: company_industry
-          in: query
-          description: Komma-gescheiden industriecodes (zie schema `CompanyIndustry`).
-          schema: { type: string }
-        - name: company_industry_exclude
-          in: query
-          description: Industriecodes om uit te sluiten.
-          schema: { type: string }
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met posts.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedPosts" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /posts/{post_id}:
-    get:
-      tags: [Posts]
-      operationId: getPost
-      summary: Get post
-      description: Eén post op basis van de Jungler-ID (`_id`).
-      x-rate-limit: 1200/minute
-      parameters:
-        - $ref: "#/components/parameters/PostIdPath"
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-      responses:
-        "200":
-          description: De post.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Post" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404":
-          description: Post niet gevonden.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { detail: "post_not_found" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /engagers/signal/{signal_id}:
-    get:
-      tags: [Engagers]
-      operationId: listSignalEngagers
-      summary: List signal engagers
-      description: Gepagineerde commenters en reactors voor een signal. Alleen voor `user_profile`- en `company_profile`-signals.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/SignalIdPath"
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/EngagerPageSize"
-        - $ref: "#/components/parameters/SnapshotTime"
-        - $ref: "#/components/parameters/EngagementTypeFilter"
-        - $ref: "#/components/parameters/PostTimePeriod"
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met engagers.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedEngagers" }
-        "400": { $ref: "#/components/responses/EngagersBadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /engagers/signal/{signal_id}/contacts:
-    get:
-      tags: [Engagers]
-      operationId: listSignalContacts
-      summary: List signal contacts
-      description: |
-        Gededupliceerde contacts uit een signal, met geaggregeerde engagement-statistieken.
-        Alleen voor `user_profile`- en `company_profile`-signals.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/SignalIdPath"
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/ContactPageSize"
-        - $ref: "#/components/parameters/SnapshotTime"
-        - $ref: "#/components/parameters/ActivityFilter"
-        - $ref: "#/components/parameters/PostTimePeriod"
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met contacts.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedContacts" }
-        "400": { $ref: "#/components/responses/EngagersBadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/SignalNotInWorkspace" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /engagers/post/{post_id}:
-    get:
-      tags: [Engagers]
-      operationId: listPostEngagers
-      summary: List post engagers
-      description: |
-        Gepagineerde engagers voor één post, gesorteerd op `created_at` (capture-tijd) aflopend.
-        Handig voor incrementele sync in combinatie met `last_engagement_at` uit de Posts API.
-      x-rate-limit: 60/minute
-      parameters:
-        - name: post_id
-          in: path
-          required: true
-          description: De `jungler_post_id` van een engager-item, of de post-`_id` uit de Posts API.
-          schema: { $ref: "#/components/schemas/ObjectId" }
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/EngagerPageSize"
-        - $ref: "#/components/parameters/SnapshotTime"
-        - $ref: "#/components/parameters/EngagementTypeFilter"
-        - name: captured_after
-          in: query
-          description: Exclusieve ondergrens (UTC) voor de capture-tijd van de engager. Geef de `last_engagement_at` van je vorige sync mee.
-          schema: { type: string, format: date-time }
-        - name: captured_before
-          in: query
-          description: Inclusieve bovengrens (UTC) voor de capture-tijd van de engager.
-          schema: { type: string, format: date-time }
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met engagers.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedEngagers" }
-        "400": { $ref: "#/components/responses/EngagersBadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /engagers/workbook/{workbook_id}:
-    get:
-      tags: [Engagers]
-      operationId: listWorkbookEngagers
-      summary: List workbook engagers
-      description: Gepagineerde commenters en reactors uit een workbook.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkbookIdPath"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/EngagerPageSize"
-        - $ref: "#/components/parameters/SnapshotTime"
-        - $ref: "#/components/parameters/EngagementTypeFilter"
-        - $ref: "#/components/parameters/PostTimePeriod"
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met engagers.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedEngagers" }
-        "400": { $ref: "#/components/responses/EngagersBadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /engagers/workbook/{workbook_id}/contacts:
-    get:
-      tags: [Engagers]
-      operationId: listWorkbookContacts
-      summary: List workbook contacts
-      description: Gededupliceerde contacts uit een workbook, met geaggregeerde engagement-statistieken.
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkbookIdPath"
-        - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/ContactPageSize"
-        - $ref: "#/components/parameters/SnapshotTime"
-        - $ref: "#/components/parameters/ActivityFilter"
-        - $ref: "#/components/parameters/PostTimePeriod"
-        - $ref: "#/components/parameters/EmailStatusFilter"
-      responses:
-        "200":
-          description: Pagina met contacts.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedContacts" }
-        "400": { $ref: "#/components/responses/EngagersBadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /workbooks:
-    post:
-      tags: [Workbooks]
-      operationId: createWorkbook
-      summary: Create workbook run
-      description: |
-        Maakt een tijdelijk workbook aan en start direct een extractie van interacties van één post.
-        Extractie duurt doorgaans 1-3 minuten. Workbook-data **verloopt na 12 uur**.
-        Maximaal twee workbook-runs per workspace draaien tegelijk; overige runs blijven in de wachtrij.
-      x-rate-limit: 30/minute
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateWorkbookRequest" }
-      responses:
-        "200":
-          description: Run aangemaakt.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/CreatedWorkbookRun" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "422": { $ref: "#/components/responses/ValidationError" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-      callbacks:
-        runCompleted:
-          "{$request.body#/webhook_url}":
-            post:
-              summary: Workbook run completion callback
-              description: |
-                Verstuurd wanneer de extractie klaar is (succes of mislukt). Een `2xx` geldt als
-                geslaagd; timeout 5 seconden, 1 retry na 30 seconden. Verwerk callbacks idempotent.
-              requestBody:
-                required: true
-                content:
-                  application/json:
-                    schema: { $ref: "#/components/schemas/WorkbookRun" }
-              responses:
-                "2XX":
-                  description: Callback ontvangen.
-
-  /workbooks/runs/{run_id}:
-    get:
-      tags: [Workbooks]
-      operationId: getWorkbookRunStatus
-      summary: Get workbook run status
-      description: |
-        Voortgang van één workbook-run. Velden met waarde `null` kunnen ontbreken; counts,
-        `post_url` en `results_expire_at` zijn pas gevuld na een terminale status.
-      x-rate-limit: 60/minute
-      parameters:
-        - name: run_id
-          in: path
-          required: true
-          description: De run-ID uit de workbook-aanmaak.
-          schema: { $ref: "#/components/schemas/ObjectId" }
-      responses:
-        "200":
-          description: Run-status.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/WorkbookRun" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /workbooks/{workbook_id}/run:
-    get:
-      tags: [Workbooks]
-      operationId: getLatestWorkbookRun
-      summary: Get latest run of workbook (legacy)
-      deprecated: true
-      description: Blijft beschikbaar voor compatibiliteit en geeft de laatste run van het workbook. Gebruik bij voorkeur `GET /workbooks/runs/{run_id}`.
-      parameters:
-        - $ref: "#/components/parameters/WorkbookIdPath"
-      responses:
-        "200":
-          description: Run-status.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/WorkbookRun" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
-
-  /workbooks/schedules:
-    post:
-      tags: [Workbooks]
-      operationId: createWorkbookSchedule
-      summary: Schedule a workbook run
-      description: |
-        Plant een toekomstige workbook-extractie voor één post. `webhook_url` is verplicht.
-        Het gedispatchte workbook verloopt 12 uur na dispatch.
-        Bij een bestaande `idempotency_key` in dezelfde workspace komt `200 OK` met het originele schedule terug.
-      x-rate-limit: 30/minute
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreateWorkbookScheduleRequest" }
-      responses:
-        "200":
-          description: Replay met bestaande `idempotency_key`; origineel schedule.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/CreatedWorkbookSchedule" }
-        "201":
-          description: Schedule aangemaakt.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/CreatedWorkbookSchedule" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "422": { $ref: "#/components/responses/ValidationError" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-      callbacks:
-        runCompleted:
-          "{$request.body#/webhook_url}":
-            post:
-              summary: Scheduled workbook run completion callback
-              description: Zelfde payload als bij directe workbook-runs, met `schedule_id` gevuld. Verwerk idempotent.
-              requestBody:
-                required: true
-                content:
-                  application/json:
-                    schema: { $ref: "#/components/schemas/WorkbookRun" }
-              responses:
-                "2XX":
-                  description: Callback ontvangen.
-    get:
-      tags: [Workbooks]
-      operationId: listWorkbookSchedules
-      summary: List schedules
-      x-rate-limit: 60/minute
-      parameters:
-        - $ref: "#/components/parameters/WorkspaceIdQuery"
-        - name: status
-          in: query
-          schema: { $ref: "#/components/schemas/ScheduleStatus" }
-        - $ref: "#/components/parameters/Page"
-        - name: page_size
-          in: query
-          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
-        - $ref: "#/components/parameters/SnapshotTime"
-      responses:
-        "200":
-          description: Pagina met schedules.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/PaginatedSchedules" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /workbooks/schedules/{schedule_id}:
-    parameters:
-      - name: schedule_id
-        in: path
-        required: true
-        schema: { $ref: "#/components/schemas/ObjectId" }
-    get:
-      tags: [Workbooks]
-      operationId: getWorkbookSchedule
-      summary: Get schedule
-      x-rate-limit: 60/minute
-      responses:
-        "200":
-          description: Het schedule.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/WorkbookSchedule" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-    delete:
-      tags: [Workbooks]
-      operationId: cancelWorkbookSchedule
-      summary: Cancel schedule
-      description: |
-        Annuleren kan vóór dispatch. `scheduled` → `200` met status `cancelled`;
-        `cancelled`/`failed` → `200` idempotent; `dispatching`/`dispatched` → `409 Conflict`.
-      x-rate-limit: 30/minute
-      responses:
-        "200":
-          description: Schedule geannuleerd (of was al geannuleerd/mislukt).
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/WorkbookSchedule" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
-        "409":
-          description: Schedule wordt al gedispatcht of is gedispatcht.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ScheduleConflictError" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /tools/social-url-timestamp:
-    get:
-      tags: [Tools]
-      operationId: getSocialUrlTimestamp
-      summary: Social URL timestamp
-      description: UTC-aanmaaktijd van een social media post, gedecodeerd uit de post-ID.
-      x-rate-limit: 500/minute
-      parameters:
-        - name: url
-          in: query
-          required: true
-          description: Een post/activity-URL (of numerieke activity-ID).
-          schema: { type: string }
-          example: "https://www.linkedin.com/posts/johndoe_activity-7349008612637241345"
-      responses:
-        "200":
-          description: Timestamp.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/SocialUrlTimestamp" }
-        "400":
-          description: Input kon niet geparset worden.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
-              example: { detail: "Input not valid: https://www.linkedin.com/in/johndoe" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-  /tools/parse-name:
-    get:
-      tags: [Tools]
-      operationId: parseName
-      summary: Parse name
-      description: Splitst een volledige naam in voor- en achternaam (ook met prefixen, suffixen en meerdere delen).
-      x-rate-limit: 500/minute
-      parameters:
-        - name: name
-          in: query
-          required: true
-          schema: { type: string }
-          example: "John Doe"
-      responses:
-        "200":
-          description: Geparste naam.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ParsedName" }
-        "400": { $ref: "#/components/responses/BadRequest" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "429": { $ref: "#/components/responses/TooManyRequests" }
-
-components:
-  securitySchemes:
-    ApiKeyAuth:
-      type: apiKey
-      in: header
-      name: X-API-Key
-
-  parameters:
-    WorkspaceIdPath:
-      name: workspace_id
-      in: path
-      required: true
-      schema: { $ref: "#/components/schemas/ObjectId" }
-    WorkspaceIdQuery:
-      name: workspace_id
-      in: query
-      required: true
-      description: Workspace-ID.
-      schema: { $ref: "#/components/schemas/ObjectId" }
-    SignalIdPath:
-      name: signal_id
-      in: path
-      required: true
-      schema: { $ref: "#/components/schemas/ObjectId" }
-    PostIdPath:
-      name: post_id
-      in: path
-      required: true
-      schema: { $ref: "#/components/schemas/ObjectId" }
-    WorkbookIdPath:
-      name: workbook_id
-      in: path
-      required: true
-      schema: { $ref: "#/components/schemas/ObjectId" }
-    Page:
-      name: page
-      in: query
-      description: Paginanummer (1-indexed).
-      schema: { type: integer, minimum: 1, default: 1 }
-    EngagerPageSize:
-      name: page_size
-      in: query
-      description: Items per pagina.
-      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
-    ContactPageSize:
-      name: page_size
-      in: query
-      description: Items per pagina.
-      schema: { type: integer, minimum: 1, maximum: 500, default: 500 }
-    SnapshotTime:
-      name: snapshot_time
-      in: query
-      description: |
-        ISO 8601-timestamp die stabiliseert welke records over pagina's heen bestaan.
-        Laat weg op pagina 1 en hergebruik daarna de teruggegeven waarde.
-        Let op: URL-encode een `+` als `%2B`.
-      schema: { type: string, format: date-time }
-    EngagementTypeFilter:
-      name: engagement_type
-      in: query
-      description: Filter op type engagement.
-      schema: { $ref: "#/components/schemas/EngagementType" }
-    PostTimePeriod:
-      name: post_time_period
-      in: query
-      description: |
-        Beperk tot engagements op posts uit de genoemde recente periode. Met 1 dag ingestion-buffer:
-        `day` = 2 dagen, `week` = 8 dagen, `month` = 32 dagen, `three_months` = 91 dagen.
-        Weglaten = volledige retentie van 180 dagen.
-      schema: { type: string, enum: [day, week, month, three_months] }
-    ActivityFilter:
-      name: activity_filter
-      in: query
-      description: "Filter op activiteit: `commenters`, `reactors`, of komma-gescheiden combinatie."
-      schema: { type: string }
-    EmailStatusFilter:
-      name: email_status
-      in: query
-      description: "Filter op e-mailstatus, komma-gescheiden: `found`, `not_found`, `pending`. Ongeldige waarden geven 400."
-      schema: { type: string }
-
-  responses:
-    BadRequest:
-      description: Ongeldige parameters.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "Invalid workspace_id format" }
-    EngagersBadRequest:
-      description: Ongeldige parameters, of signaltype zonder engagers.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          examples:
-            invalidSignalId: { value: { detail: "invalid_signal_id_format" } }
-            noEngagers: { value: { detail: "signal_type_does_not_have_engagers" } }
-            invalidEngagementType: { value: { detail: "invalid_engagement_type" } }
-    Unauthorized:
-      description: Ongeldige of ontbrekende API key.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "Invalid or missing API key" }
-    Forbidden:
-      description: Geen toegang tot de resource.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "No access to workspace" }
-    SignalNotInWorkspace:
-      description: Signal hoort niet bij je workspace.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "signal_not_in_workspace" }
-    NotFound:
-      description: Resource bestaat niet.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-    SignalNotFound:
-      description: Signal niet gevonden.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "Signal not found" }
-    ValidationError:
-      description: Validatiefout.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "Invalid post URL format" }
-    TooManyRequests:
-      description: Rate limit overschreden.
-      content:
-        application/json:
-          schema: { $ref: "#/components/schemas/Error" }
-          example: { detail: "Rate limit exceeded" }
-
-  schemas:
-    ObjectId:
-      type: string
-      pattern: "^[0-9a-fA-F]{24}$"
-      description: MongoDB ObjectId (24 hex-tekens).
-      example: "507f1f77bcf86cd799439011"
-
-    Error:
-      type: object
-      required: [detail]
-      properties:
-        detail:
-          description: Foutmelding; meestal een string, soms een gestructureerd object.
-          oneOf:
-            - type: string
-            - type: object
-              additionalProperties: true
-
-    ScheduleConflictError:
-      type: object
-      properties:
-        detail:
-          type: object
-          properties:
-            schedule_id: { $ref: "#/components/schemas/ObjectId" }
-            status: { $ref: "#/components/schemas/ScheduleStatus" }
-            run_id: { type: string, nullable: true }
-            workbook_id: { type: string, nullable: true }
-            message: { type: string, example: "schedule_in_status_dispatched" }
-
-    # ---------- Workspaces ----------
-    WorkspaceMembership:
-      type: object
-      properties:
-        membership_id: { type: string, description: Lidmaatschaps-ID van de gebruiker in deze workspace. }
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        workspace_name: { type: string }
-        user_role: { type: string, description: Jouw rol in de workspace., example: owner }
-
-    Subscription:
-      type: object
-      properties:
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        plan: { type: string, example: pro }
-        credits_limit: { type: number, example: 5000.0 }
-        credits_used: { type: number, example: 1500.0 }
-        credits_remaining: { type: number, example: 3500.0 }
-        start_at: { type: string, format: date-time }
-        end_at: { type: string, format: date-time }
-        max_signal_count: { type: integer, description: Maximaal aantal actieve signals., example: 10 }
-        max_team_size: { type: integer, description: Maximaal aantal teamleden., example: 5 }
-
-    # ---------- Signals ----------
-    QueryType:
-      type: string
-      enum: [search_keyword, user_profile, company_profile]
-
-    EngagementType:
-      type: string
-      enum: [COMMENT, REACTION]
-
-    Signal:
-      type: object
-      description: Velden met waarde `null` worden weggelaten.
-      required: [_id, name, query, frequency, is_activated, query_type, track_engagement, created_at, updated_at]
-      properties:
-        _id: { $ref: "#/components/schemas/ObjectId" }
-        name: { type: string, example: "Brand Mentions" }
-        query: { type: string, description: "Keywords, profiel-URL of bedrijfs-URL.", example: "lemlist OR \"heyreach\"" }
-        frequency: { type: integer, description: Runfrequentie in uren., default: 24 }
-        is_activated: { type: boolean }
-        prompt: { type: string, description: "Custom AI-filterprompt (alleen keyword-signals, indien ingesteld)." }
-        query_type: { $ref: "#/components/schemas/QueryType" }
-        query_identifier: { type: string, description: "Gebruikersnaam of bedrijfs-ID uit de URL (alleen profile/company)." }
-        track_engagement: { type: boolean, description: "Of engagers worden vastgelegd (`false` = alleen posts)." }
-        engagement_type:
-          allOf: [{ $ref: "#/components/schemas/EngagementType" }]
-          description: "Alleen profile/company als één type is gekozen; weggelaten bij beide."
-        webhook_url: { type: string, format: uri, description: HTTPS-URL voor run-completion callbacks. }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-
-    CreatedSignal:
-      allOf:
-        - $ref: "#/components/schemas/Signal"
-        - type: object
-          properties:
-            run:
-              type: object
-              properties:
-                run_id: { $ref: "#/components/schemas/ObjectId" }
-                status: { $ref: "#/components/schemas/SignalRunStatus" }
-
-    CreateSignalRequest:
-      type: object
-      required: [workspace_id, name, query]
-      properties:
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        name: { type: string, minLength: 1, maxLength: 69 }
-        query: { type: string, minLength: 3, maxLength: 300, description: "Keywords, profiel-URL of bedrijfs-URL; bepaalt `query_type`." }
-        prompt: { type: string, minLength: 3, maxLength: 3000, description: Optionele AI-filterprompt voor keyword-signals. Genegeerd bij profile/company. }
-        prompt_name: { type: string, description: "Weergavenaam van de prompt (default \"AI filter\"). Write-only." }
-        webhook_url: { type: string, format: uri, maxLength: 1000, description: HTTPS-URL voor run-completion callbacks. }
-        initial_window:
-          type: string
-          enum: [past_month, past_week, none]
-          default: past_month
-          description: Backfill-venster van de eerste run (alleen profile/company). Write-only. Niet-default waarden worden geweigerd bij keyword-signals.
-        track_engagement:
-          type: boolean
-          default: true
-          description: Engagers vastleggen voor profile/company-signals. Geweigerd bij keyword-signals.
-        engagement_type:
-          allOf: [{ $ref: "#/components/schemas/EngagementType" }]
-          description: Alleen `COMMENT` of `REACTION` vastleggen (profile/company). Weglaten = beide. Geweigerd bij keyword-signals.
-
-    SignalRunStatus:
-      type: string
-      enum: [queued, pending, running, success, success_with_warnings, failed, timed_out, cancelled]
-
-    SignalRun:
-      type: object
-      required: [signal_id, run_id, status]
-      properties:
-        signal_id: { $ref: "#/components/schemas/ObjectId" }
-        run_id: { $ref: "#/components/schemas/ObjectId" }
-        status: { $ref: "#/components/schemas/SignalRunStatus" }
-        started_at: { type: string, format: date-time, description: Aanwezig na start. }
-        completed_at: { type: string, format: date-time, description: Aanwezig na afronding. }
-        duration_ms: { type: integer, description: Aanwezig na afronding. }
-        error: { type: string, description: Foutmelding bij mislukking. }
-
-    # ---------- Posts ----------
-    EmailStatus:
-      type: string
-      enum: [found, not_found, pending]
-      description: |
-        `found` = e-mail gevonden; `not_found` = terminaal, geen e-mail;
-        `pending` = verrijking loopt nog (tijdelijk).
-
-    RoleLevel:
-      type: string
-      nullable: true
-      description: "Authority — de rang die de functietitel claimt. `out_of_scope` wordt alleen teruggegeven, niet gefilterd."
-      enum: [executive, vp, director, manager, principal, senior_ic, ic, junior, unranked, out_of_scope, null]
-
-    EmploymentContext:
-      type: string
-      nullable: true
-      enum: [in_house, founder_owner, fractional, interim, advisory, freelance, null]
-
-    JobFunction:
-      type: string
-      nullable: true
-      enum: [ENG, PRD, MKT, SAL, FIN, OPS, HR, CS, LEG, DA, DSN, EDU, AMB, GEN, UNMAPPED, null]
-
-    CompanySize:
-      type: string
-      nullable: true
-      enum: [XXS, XS, S, M, L, XL, XXL, UNMAPPED, null]
-
-    CompanyIndustry:
-      type: string
-      description: Industriecode.
-      enum:
-        - TECH_INFO_MEDIA
-        - FINANCIAL_SERVICES
-        - HEALTH_CARE
-        - PROFESSIONAL_SERVICES
-        - MANUFACTURING
-        - RETAIL
-        - EDUCATION
-        - CONSTRUCTION
-        - CONSUMER_SERVICES
-        - ENTERTAINMENT
-        - TRANSPORTATION_LOGISTICS
-        - ACCOMMODATION_SERVICES
-        - ADMINISTRATIVE_SERVICES
-        - FARMING_RANCHING_FORESTRY
-        - GOV_ADMIN
-        - HOLDING_COMPANIES
-        - OIL_GAS_MINING
-        - REAL_ESTATE_EQUIPMENT
-        - UTILITIES
-        - WHOLESALE
-        - UNMAPPED
-
-    PostAuthor:
-      type: object
-      properties:
-        name: { type: string }
-        profile_url: { type: string, format: uri }
-        profile_image_url: { type: string, format: uri }
-        description: { type: string, description: Headline. }
-        username: { type: string }
-        profile_type: { type: string, enum: [user, company] }
-        country_code: { type: string, example: US }
-        country: { type: string, example: United States }
-        role_level: { $ref: "#/components/schemas/RoleLevel" }
-        employment_context: { $ref: "#/components/schemas/EmploymentContext" }
-        function: { $ref: "#/components/schemas/JobFunction" }
-        company_size: { $ref: "#/components/schemas/CompanySize" }
-        company_industry: { type: string, nullable: true }
-        company_website: { type: string, nullable: true }
-        email: { type: string, nullable: true }
-        email_status: { $ref: "#/components/schemas/EmailStatus" }
-
-    EmbeddedContent:
-      type: object
-      nullable: true
-      properties:
-        type: { type: string, example: article }
-        url: { type: string, format: uri }
-        title: { type: string }
-        content: { type: string }
-        image_url: { type: string, format: uri }
-        thumbnail_url: { type: string, format: uri }
-
-    PostClassification:
-      type: object
-      properties:
-        type: { type: string }
-        lang: { type: string, example: en }
-        sentiment: { type: string, enum: [positive, negative, neutral] }
-        weight: { type: number, example: 0.85 }
-
-    Post:
-      type: object
-      properties:
-        _id: { $ref: "#/components/schemas/ObjectId" }
-        url: { type: string, format: uri }
-        urn: { type: string, example: "urn:li:activity:7349008612637241345" }
-        content: { type: string }
-        author: { $ref: "#/components/schemas/PostAuthor" }
-        posted_at: { type: string, format: date-time, description: Publicatiemoment online. }
-        reaction_count: { type: integer }
-        comment_count: { type: integer }
-        embedded_content: { $ref: "#/components/schemas/EmbeddedContent" }
-        search_id: { $ref: "#/components/schemas/ObjectId" }
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        classification: { $ref: "#/components/schemas/PostClassification" }
-        created_at: { type: string, format: date-time, description: Moment waarop Jungler de post vastlegde. }
-        updated_at: { type: string, format: date-time }
-        last_engagement_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: Moment waarop Jungler het laatst een nieuwe engager vastlegde (capture-tijd, niet `engaged_at`).
-
-    Pagination:
-      type: object
-      required: [total, page, page_size, pages, snapshot_time]
-      properties:
-        total: { type: integer, description: Totaal aantal matchende items. }
-        page: { type: integer }
-        page_size: { type: integer }
-        pages: { type: integer }
-        snapshot_time: { type: string, format: date-time }
-
-    PaginatedPosts:
-      allOf:
-        - $ref: "#/components/schemas/Pagination"
-        - type: object
-          required: [items]
-          properties:
-            items:
-              type: array
-              items: { $ref: "#/components/schemas/Post" }
-
-    # ---------- Engagers ----------
-    EngagerAuthor:
-      type: object
-      properties:
-        name: { type: string }
-        first_name: { type: string, nullable: true }
-        last_name: { type: string, nullable: true }
-        urn: { type: string, nullable: true, example: "urn:li:member:789" }
-        username: { type: string, nullable: true }
-        profile_url: { type: string, nullable: true }
-        profile_image_url: { type: string, nullable: true }
-        description: { type: string, nullable: true, description: Headline/titel. }
-        profile_type: { type: string, enum: [user, company] }
-        summary: { type: string, nullable: true }
-        company_name: { type: string, nullable: true }
-        company_website: { type: string, nullable: true }
-        email: { type: string, nullable: true }
-        email_status: { $ref: "#/components/schemas/EmailStatus" }
-        title: { type: string, nullable: true }
-        company_icon_url: { type: string, nullable: true }
-        loc_country: { type: string, nullable: true }
-        loc_region: { type: string, nullable: true, description: "Regio (NA, EU, AP)." }
-        loc_code: { type: string, nullable: true, description: ISO-landcode. }
-        loc_city: { type: string, nullable: true }
-        loc_state: { type: string, nullable: true }
-        company_size: { $ref: "#/components/schemas/CompanySize" }
-        company_industry: { type: string, nullable: true }
-        company_hq_loc_country: { type: string, nullable: true }
-        company_hq_loc_code: { type: string, nullable: true }
-        role_level: { $ref: "#/components/schemas/RoleLevel" }
-        employment_context: { $ref: "#/components/schemas/EmploymentContext" }
-        function: { $ref: "#/components/schemas/JobFunction" }
-
-    CommentMeta:
-      type: object
-      nullable: true
-      properties:
-        is_reply: { type: boolean }
-        replies: { type: integer }
-        is_pinned: { type: boolean }
-        is_edited: { type: boolean }
-
-    Engager:
-      type: object
-      properties:
-        engagement_type: { $ref: "#/components/schemas/EngagementType" }
-        urn: { type: string, description: Engagement-URN (dedup-sleutel). }
-        post_url: { type: string, format: uri }
-        jungler_post_id: { type: string, nullable: true }
-        author: { $ref: "#/components/schemas/EngagerAuthor" }
-        content: { type: string, nullable: true, description: Commenttekst (null bij reactions). }
-        comment_meta: { $ref: "#/components/schemas/CommentMeta" }
-        reaction_type:
-          type: string
-          nullable: true
-          enum: [LIKE, APPRECIATION, EMPATHY, INTEREST, PRAISE, ENTERTAINMENT, null]
-        engaged_at: { type: string, format: date-time }
-
-    Contact:
-      allOf:
-        - $ref: "#/components/schemas/EngagerAuthor"
-        - type: object
-          properties:
-            stats:
-              type: object
-              description: Engagement-tellingen (geschaald naar `post_time_period` indien gezet).
-              properties:
-                comments: { type: integer }
-                reactions: { type: integer }
-            last_engaged_at: { type: string, format: date-time, nullable: true }
-
-    PaginatedEngagers:
-      allOf:
-        - $ref: "#/components/schemas/Pagination"
-        - type: object
-          required: [items]
-          properties:
-            items:
-              type: array
-              items: { $ref: "#/components/schemas/Engager" }
-
-    PaginatedContacts:
-      allOf:
-        - $ref: "#/components/schemas/Pagination"
-        - type: object
-          required: [items]
-          properties:
-            items:
-              type: array
-              items: { $ref: "#/components/schemas/Contact" }
-
-    # ---------- Workbooks ----------
-    DataTypes:
-      type: array
-      minItems: 1
-      description: Te extraheren datatypes (hoofdletterongevoelig; postdata zit er altijd bij).
-      items: { type: string, enum: [comment, reaction] }
-      example: [comment, reaction]
-
-    CreateWorkbookRequest:
-      type: object
-      required: [workspace_id, post_url, data_types]
-      properties:
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        post_url:
-          type: string
-          format: uri
-          example: "https://www.linkedin.com/feed/update/urn:li:activity:1234567890"
-        data_types: { $ref: "#/components/schemas/DataTypes" }
-        webhook_url: { type: string, format: uri, maxLength: 1000, description: HTTPS-URL die wordt aangeroepen als de run klaar is. }
-
-    WorkbookRunStatus:
-      type: string
-      enum: [queued, running, success, success_credits_exhausted, failed]
-
-    CreatedWorkbookRun:
-      type: object
-      properties:
-        run_id: { $ref: "#/components/schemas/ObjectId" }
-        status: { $ref: "#/components/schemas/WorkbookRunStatus" }
-        workbook_id: { $ref: "#/components/schemas/ObjectId" }
-
-    WorkbookRun:
-      type: object
-      description: Run-status en ook payload van de completion-webhook. Velden met `null` kunnen ontbreken bij polling.
-      properties:
-        schedule_id: { type: string, nullable: true, description: "Gevuld bij geplande runs, `null` bij directe runs." }
-        workbook_id: { $ref: "#/components/schemas/ObjectId" }
-        run_id: { $ref: "#/components/schemas/ObjectId" }
-        status: { $ref: "#/components/schemas/WorkbookRunStatus" }
-        started_at: { type: string, format: date-time, nullable: true }
-        completed_at: { type: string, format: date-time, nullable: true }
-        duration_ms: { type: integer, nullable: true }
-        post_url: { type: string, format: uri }
-        post_urn: { type: string }
-        items_collected: { type: integer }
-        items_available: { type: integer }
-        credits_consumed: { type: number }
-        credits_exhausted: { type: boolean }
-        counts:
-          type: object
-          properties:
-            posts: { type: integer }
-            comments: { type: integer }
-            reactions: { type: integer }
-            raw_engagements: { type: integer }
-            unique_contacts: { type: integer }
-        results_expire_at: { type: string, format: date-time }
-        error: { type: string, nullable: true }
-
-    ScheduleStatus:
-      type: string
-      enum: [scheduled, dispatching, dispatched, cancelled, failed]
-
-    CreateWorkbookScheduleRequest:
-      type: object
-      required: [workspace_id, post_url, data_types, scheduled_at, webhook_url]
-      properties:
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        post_url: { type: string, format: uri }
-        data_types: { $ref: "#/components/schemas/DataTypes" }
-        scheduled_at:
-          type: string
-          format: date-time
-          description: UTC. Minimaal 60 seconden in de toekomst en maximaal 30 dagen vooruit.
-        webhook_url: { type: string, format: uri, maxLength: 1000 }
-        idempotency_key: { type: string, description: Sleutel per workspace; replays geven het originele schedule terug. }
-
-    CreatedWorkbookSchedule:
-      type: object
-      properties:
-        schedule_id: { $ref: "#/components/schemas/ObjectId" }
-        status: { $ref: "#/components/schemas/ScheduleStatus" }
-        scheduled_at: { type: string, format: date-time }
-        dispatcher_pickup_window:
-          type: object
-          description: Verwacht oppakvenster van de scheduler (best-effort).
-          properties:
-            from: { type: string, format: date-time }
-            to: { type: string, format: date-time }
-
-    WorkbookSchedule:
-      type: object
-      properties:
-        schedule_id: { $ref: "#/components/schemas/ObjectId" }
-        workspace_id: { $ref: "#/components/schemas/ObjectId" }
-        post_url: { type: string, format: uri }
-        post_urn: { type: string }
-        data_types: { $ref: "#/components/schemas/DataTypes" }
-        webhook_url: { type: string, format: uri }
-        scheduled_at: { type: string, format: date-time }
-        status: { $ref: "#/components/schemas/ScheduleStatus" }
-        workbook_id: { type: string, nullable: true }
-        run_id: { type: string, nullable: true }
-        dispatching_at: { type: string, format: date-time, nullable: true }
-        completed_at: { type: string, format: date-time, nullable: true }
-        error_message: { type: string, nullable: true }
-        idempotency_key: { type: string, nullable: true }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-
-    PaginatedSchedules:
-      allOf:
-        - $ref: "#/components/schemas/Pagination"
-        - type: object
-          required: [items]
-          properties:
-            items:
-              type: array
-              items: { $ref: "#/components/schemas/WorkbookSchedule" }
-
-    # ---------- Tools ----------
-    SocialUrlTimestamp:
-      type: object
-      properties:
-        id: { type: string, example: "7349008612637241345" }
-        timestamp: { type: string, format: date-time, example: "2025-07-10T09:36:31.230000Z" }
-        unix_ms: { type: integer, format: int64, example: 1752140191230 }
-
-    ParsedName:
-      type: object
-      properties:
-        first_name: { type: string, example: John }
-        last_name: { type: string, example: Doe }
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Jungler API",
+    "version": "1.0.0",
+    "description": "De Jungler API geeft programmatische toegang tot data die door je signals (saved searches)\nen workbooks is verzameld: workspaces, signals, posts, engagers (comments/reactions),\ncontacts en hulptools.\n\n**Authenticatie** — elke request vereist een API key in de header `X-API-Key`.\nEen key maak je aan in Jungler via *Settings → API Keys* (wordt maar één keer getoond).\n\n**Formaten**\n- Alle responses zijn JSON. Fouten hebben de vorm `{\"detail\": \"...\"}`; sommige endpoints\n  geven een gestructureerd object in `detail` (bijv. 409 Conflict).\n- Timestamps zijn ISO 8601 in UTC (`2024-01-15T10:30:00Z`); datumfilters accepteren ook `2024-01-15`.\n- Resource-ID's zijn MongoDB ObjectIds (24 hex-tekens).\n\n**Rate limiting** — per endpoint en per API key (zie `x-rate-limit` per operatie).\nBij overschrijding volgt `429 Too Many Requests`; gebruik exponential backoff.\n\n**Data retention** — posts en engagers worden 180 dagen bewaard (op basis van `posted_at`).\nWorkbook-data verloopt 12 uur na aanmaak/dispatch.\n\nBron: https://docs.jungler.ai/api\n",
+    "contact": {
+      "name": "Jungler support",
+      "email": "team@jungler.ai",
+      "url": "https://docs.jungler.ai/api"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://production.viacurrent.com/api",
+      "description": "Production"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Workspaces",
+      "description": "Workspaces waar je toegang toe hebt en hun abonnement."
+    },
+    {
+      "name": "Signals",
+      "description": "Aanmaken, beheren en monitoren van signals (saved searches)."
+    },
+    {
+      "name": "Posts",
+      "description": "Ophalen en filteren van posts die door signals zijn verzameld."
+    },
+    {
+      "name": "Engagers",
+      "description": "Interacties (comments, reactions) en gededupliceerde contacts uit signals en workbooks."
+    },
+    {
+      "name": "Workbooks",
+      "description": "Tijdelijke workbooks die interacties van één post extraheren, direct of gepland."
+    },
+    {
+      "name": "Tools",
+      "description": "Hulpendpoints voor het parsen van URL's en namen."
+    }
+  ],
+  "paths": {
+    "/workspaces": {
+      "get": {
+        "tags": [
+          "Workspaces"
+        ],
+        "operationId": "listWorkspaces",
+        "summary": "List workspaces",
+        "description": "Alle workspaces van de geauthenticeerde gebruiker, inclusief lidmaatschapsinformatie.",
+        "x-rate-limit": "30/minute",
+        "responses": {
+          "200": {
+            "description": "Lijst met workspace-lidmaatschappen.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkspaceMembership"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/workspaces/{workspace_id}/subscription": {
+      "get": {
+        "tags": [
+          "Workspaces"
+        ],
+        "operationId": "getWorkspaceSubscription",
+        "summary": "Get workspace subscription",
+        "description": "Abonnement- en creditgebruik van een workspace.",
+        "x-rate-limit": "30/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkspaceIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Abonnementsinformatie.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Geen lid van deze workspace.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "detail": "Not a member of this workspace"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Geen actief abonnement.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "detail": "no_active_subscription"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/signals": {
+      "get": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "listSignals",
+        "summary": "List signals",
+        "description": "Signals in een workspace. Velden met waarde `null` worden weggelaten.",
+        "x-rate-limit": "30/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "name": "query_type",
+            "in": "query",
+            "description": "Filter op type signal. Zonder filter worden alle types teruggegeven.",
+            "schema": {
+              "$ref": "#/components/schemas/QueryType"
+            }
+          },
+          {
+            "name": "is_activated",
+            "in": "query",
+            "description": "Filter op activatiestatus. Zonder filter zowel actief als inactief.",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lijst met signals.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Signal"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "createSignal",
+        "summary": "Create signal",
+        "description": "Maakt een nieuwe signal aan. **De eerste run start automatisch**; daarna draait de signal\nongeveer elke 24 uur. Er is geen endpoint om handmatig extra runs te starten.\n\nHet type (`query_type`) wordt automatisch afgeleid uit `query`:\nkeywords → `search_keyword`, profiel-URL → `user_profile`, bedrijfs-URL → `company_profile`.\n\nVoor `user_profile`/`company_profile` wordt het profiel synchroon gevalideerd en verrijkt;\nde request kan dan **5-15 seconden** duren.\n",
+        "x-rate-limit": "6/minute",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSignalRequest"
+              },
+              "examples": {
+                "keyword": {
+                  "summary": "Keyword signal",
+                  "value": {
+                    "workspace_id": "507f1f77bcf86cd799439013",
+                    "name": "Brand Mentions",
+                    "query": "lemlist OR \"heyreach\"",
+                    "prompt": "Only mark relevant the posts that explicitly mention lemlist or HeyReach, the outreach tools",
+                    "webhook_url": "https://customer.com/callback"
+                  }
+                },
+                "profile": {
+                  "summary": "Profile signal",
+                  "value": {
+                    "workspace_id": "507f1f77bcf86cd799439013",
+                    "name": "Follow Specific Person",
+                    "query": "https://linkedin.com/in/vearnold",
+                    "initial_window": "past_week",
+                    "engagement_type": "COMMENT"
+                  }
+                },
+                "company": {
+                  "summary": "Company signal",
+                  "value": {
+                    "workspace_id": "507f1f77bcf86cd799439013",
+                    "name": "Company Posts",
+                    "query": "https://linkedin.com/company/example-corp",
+                    "track_engagement": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Signal aangemaakt, inclusief info over de eerste run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedSignal"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Signal-limiet van de workspace bereikt, of geen toegang.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "detail": "workspace_signal_limit_reached"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "callbacks": {
+          "runCompleted": {
+            "{$request.body#/webhook_url}": {
+              "post": {
+                "summary": "Signal run completion callback",
+                "description": "Wordt verstuurd na elke voltooide run (ook de automatische eerste run en alle\ngeplande runs). Bevat geen posts of engagers; haal die op via de Posts/Engagers API.\nTimeout 5 seconden, 1 retry na 30 seconden. URL moet HTTPS zijn.\n",
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "$ref": "#/components/schemas/SignalRun"
+                      }
+                    }
+                  }
+                },
+                "responses": {
+                  "2XX": {
+                    "description": "Callback ontvangen."
+                  },
+                  "4XX": {
+                    "description": "Geldt als mislukte aflevering (net als 5XX of een timeout van 5 seconden); er volgt één retry na 30 seconden."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/signals/{signal_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SignalIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "getSignal",
+        "summary": "Get signal",
+        "description": "Gedetailleerde informatie over één signal. Velden met waarde `null` worden weggelaten.",
+        "x-rate-limit": "60/minute",
+        "responses": {
+          "200": {
+            "description": "De signal.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Signal"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "404": {
+            "$ref": "#/components/responses/SignalNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "deleteSignal",
+        "summary": "Delete signal",
+        "description": "Verwijdert een signal permanent. Verzamelde posts en engagers blijven beschikbaar.",
+        "x-rate-limit": "6/minute",
+        "responses": {
+          "204": {
+            "description": "Verwijderd (lege body)."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "404": {
+            "$ref": "#/components/responses/SignalNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/signals/{signal_id}/run": {
+      "get": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "getSignalRunStatus",
+        "summary": "Get latest run status",
+        "description": "Status van de laatste run van een signal. Poll elke 10-30 seconden; de meeste runs zijn\nbinnen 2-5 minuten klaar. Terminale statussen: `success`, `success_with_warnings`,\n`failed`, `timed_out`, `cancelled`.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SignalIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run-status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignalRun"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "404": {
+            "description": "Signal bestaat niet of heeft nog nooit gedraaid.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/signals/{signal_id}/activate": {
+      "put": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "activateSignal",
+        "summary": "Activate signal",
+        "description": "Heractiveert een gepauzeerde signal; hij draait weer volgens schema.",
+        "x-rate-limit": "6/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SignalIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bijgewerkte signal met `is_activated: true`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Signal"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "404": {
+            "$ref": "#/components/responses/SignalNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/signals/{signal_id}/deactivate": {
+      "put": {
+        "tags": [
+          "Signals"
+        ],
+        "operationId": "deactivateSignal",
+        "summary": "Deactivate signal",
+        "description": "Pauzeert een signal. Signal en verzamelde data blijven toegankelijk.",
+        "x-rate-limit": "6/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SignalIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bijgewerkte signal met `is_activated: false`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Signal"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "404": {
+            "$ref": "#/components/responses/SignalNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/posts": {
+      "get": {
+        "tags": [
+          "Posts"
+        ],
+        "operationId": "listPosts",
+        "summary": "List posts",
+        "description": "Gepagineerde lijst van posts met uitgebreide filters.\n\n**Datumvelden:** `posted_at` = publicatiemoment online; `created_at` = moment waarop Jungler\nde post vastlegde. Gebruik per request óf `posted_*` óf `created_*` filters — combineren\nwordt geweigerd. Een datumbereik mag maximaal 180 dagen beslaan, en `*_after` moet strikt\nvóór `*_before` liggen.\n\n**Paginatie:** doe de eerste request zonder `snapshot_time`, en hergebruik de teruggegeven\n`snapshot_time` voor volgende pagina's.\n\n**Incrementele engagement-sync:** gebruik `has_engagement_since` met de hoogste\n`last_engagement_at` van je vorige sync, en haal per post de nieuwe engagers op via\n`GET /engagers/post/{post_id}?captured_after=...`.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "name": "signal_ids",
+            "in": "query",
+            "required": true,
+            "description": "Komma-gescheiden lijst van signal-ID's.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "507f1f77bcf86cd799439012,507f1f77bcf86cd799439014"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Items per pagina.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "description": "Sorteerveld. Als `has_engagement_since` is gezet zonder `sort_by`, wordt gesorteerd op `last_engagement_at` aflopend.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "posted_at",
+                "created_at",
+                "weight"
+              ],
+              "default": "posted_at"
+            }
+          },
+          {
+            "name": "sort_direction",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          },
+          {
+            "name": "match",
+            "in": "query",
+            "description": "AI-relevantieclassificatie, komma-gescheiden: `relevant`, `not_relevant`, `unclassified`. Werkt alleen als AI-filtering voor de signals is ingesteld.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Posttypes, komma-gescheiden: `buying_intent`, `hiring`, `thought_leadership`, `lead_magnet`, `promotion`, `announcement`, `other`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sentiment",
+            "in": "query",
+            "description": "Sentiment, komma-gescheiden: `positive`, `negative`, `neutral`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "author",
+            "in": "query",
+            "description": "Komma-gescheiden auteurtypes.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lang",
+            "in": "query",
+            "description": "Komma-gescheiden taalcodes (bijv. `en`, `es`, `fr`, `de`).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "created_after",
+            "in": "query",
+            "description": "Inclusieve ondergrens (UTC) voor het moment waarop Jungler de post vastlegde.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "2024-01-15"
+          },
+          {
+            "name": "created_before",
+            "in": "query",
+            "description": "Inclusieve bovengrens (UTC) voor het moment waarop Jungler de post vastlegde.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "posted_after",
+            "in": "query",
+            "description": "Inclusieve ondergrens (UTC) voor het publicatiemoment.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "posted_before",
+            "in": "query",
+            "description": "Inclusieve bovengrens (UTC) voor het publicatiemoment.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "has_engagement_since",
+            "in": "query",
+            "description": "Exclusieve ondergrens (UTC). Alleen posts die strikt ná dit moment een nieuw vastgelegde comment of reaction kregen.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "country",
+            "in": "query",
+            "description": "Komma-gescheiden ISO-landcodes om op te nemen.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "country_exclude",
+            "in": "query",
+            "description": "Komma-gescheiden ISO-landcodes om uit te sluiten.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "function",
+            "in": "query",
+            "description": "Komma-gescheiden functiecodes: `ENG`, `PRD`, `MKT`, `SAL`, `FIN`, `OPS`, `HR`, `CS`, `LEG`, `DA`, `DSN`, `EDU`, `AMB`, `GEN`, `UNMAPPED`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "function_exclude",
+            "in": "query",
+            "description": "Functiecodes om uit te sluiten (zelfde waarden als `function`).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_level",
+            "in": "query",
+            "description": "Authority, komma-gescheiden: `executive`, `vp`, `director`, `manager`, `principal`, `senior_ic`, `ic`, `junior`, `unranked`, `UNMAPPED`. (`out_of_scope` komt voor in responses maar is geen filterwaarde.)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_level_exclude",
+            "in": "query",
+            "description": "Authority-niveaus om uit te sluiten.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "employment_context",
+            "in": "query",
+            "description": "Komma-gescheiden: `in_house`, `founder_owner`, `fractional`, `interim`, `advisory`, `freelance`, `UNMAPPED`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "employment_context_exclude",
+            "in": "query",
+            "description": "Employment contexts om uit te sluiten.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "company_size",
+            "in": "query",
+            "description": "Komma-gescheiden: `XXS` (1-10), `XS` (11-50), `S` (51-200), `M` (201-500), `L` (501-1000), `XL` (1001-5000), `XXL` (5001+), `UNMAPPED`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "company_size_exclude",
+            "in": "query",
+            "description": "Bedrijfsgroottes om uit te sluiten.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "company_industry",
+            "in": "query",
+            "description": "Komma-gescheiden industriecodes (zie schema `CompanyIndustry`).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "company_industry_exclude",
+            "in": "query",
+            "description": "Industriecodes om uit te sluiten.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met posts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedPosts"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/posts/{post_id}": {
+      "get": {
+        "tags": [
+          "Posts"
+        ],
+        "operationId": "getPost",
+        "summary": "Get post",
+        "description": "Eén post op basis van de Jungler-ID (`_id`).",
+        "x-rate-limit": "1200/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PostIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "De post.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Post"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Post niet gevonden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "detail": "post_not_found"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/engagers/signal/{signal_id}": {
+      "get": {
+        "tags": [
+          "Engagers"
+        ],
+        "operationId": "listSignalEngagers",
+        "summary": "List signal engagers",
+        "description": "Gepagineerde commenters en reactors voor een signal. Alleen voor `user_profile`- en `company_profile`-signals.",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SignalIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/EngagerPageSize"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "$ref": "#/components/parameters/EngagementTypeFilter"
+          },
+          {
+            "$ref": "#/components/parameters/PostTimePeriod"
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met engagers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedEngagers"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/EngagersBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/engagers/signal/{signal_id}/contacts": {
+      "get": {
+        "tags": [
+          "Engagers"
+        ],
+        "operationId": "listSignalContacts",
+        "summary": "List signal contacts",
+        "description": "Gededupliceerde contacts uit een signal, met geaggregeerde engagement-statistieken.\nAlleen voor `user_profile`- en `company_profile`-signals.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SignalIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/ContactPageSize"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "$ref": "#/components/parameters/ActivityFilter"
+          },
+          {
+            "$ref": "#/components/parameters/PostTimePeriod"
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met contacts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedContacts"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/EngagersBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/SignalNotInWorkspace"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/engagers/post/{post_id}": {
+      "get": {
+        "tags": [
+          "Engagers"
+        ],
+        "operationId": "listPostEngagers",
+        "summary": "List post engagers",
+        "description": "Gepagineerde engagers voor één post, gesorteerd op `created_at` (capture-tijd) aflopend.\nHandig voor incrementele sync in combinatie met `last_engagement_at` uit de Posts API.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "name": "post_id",
+            "in": "path",
+            "required": true,
+            "description": "De `jungler_post_id` van een engager-item, of de post-`_id` uit de Posts API.",
+            "schema": {
+              "$ref": "#/components/schemas/ObjectId"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/EngagerPageSize"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "$ref": "#/components/parameters/EngagementTypeFilter"
+          },
+          {
+            "name": "captured_after",
+            "in": "query",
+            "description": "Exclusieve ondergrens (UTC) voor de capture-tijd van de engager. Geef de `last_engagement_at` van je vorige sync mee.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "captured_before",
+            "in": "query",
+            "description": "Inclusieve bovengrens (UTC) voor de capture-tijd van de engager.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met engagers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedEngagers"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/EngagersBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/engagers/workbook/{workbook_id}": {
+      "get": {
+        "tags": [
+          "Engagers"
+        ],
+        "operationId": "listWorkbookEngagers",
+        "summary": "List workbook engagers",
+        "description": "Gepagineerde commenters en reactors uit een workbook.",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkbookIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/EngagerPageSize"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "$ref": "#/components/parameters/EngagementTypeFilter"
+          },
+          {
+            "$ref": "#/components/parameters/PostTimePeriod"
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met engagers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedEngagers"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/EngagersBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/engagers/workbook/{workbook_id}/contacts": {
+      "get": {
+        "tags": [
+          "Engagers"
+        ],
+        "operationId": "listWorkbookContacts",
+        "summary": "List workbook contacts",
+        "description": "Gededupliceerde contacts uit een workbook, met geaggregeerde engagement-statistieken.",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkbookIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "$ref": "#/components/parameters/ContactPageSize"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          },
+          {
+            "$ref": "#/components/parameters/ActivityFilter"
+          },
+          {
+            "$ref": "#/components/parameters/PostTimePeriod"
+          },
+          {
+            "$ref": "#/components/parameters/EmailStatusFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met contacts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedContacts"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/EngagersBadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/workbooks": {
+      "post": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "createWorkbook",
+        "summary": "Create workbook run",
+        "description": "Maakt een tijdelijk workbook aan en start direct een extractie van interacties van één post.\nExtractie duurt doorgaans 1-3 minuten. Workbook-data **verloopt na 12 uur**.\nMaximaal twee workbook-runs per workspace draaien tegelijk; overige runs blijven in de wachtrij.\n",
+        "x-rate-limit": "30/minute",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkbookRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Run aangemaakt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedWorkbookRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "callbacks": {
+          "runCompleted": {
+            "{$request.body#/webhook_url}": {
+              "post": {
+                "summary": "Workbook run completion callback",
+                "description": "Verstuurd wanneer de extractie klaar is (succes of mislukt). Een `2xx` geldt als\ngeslaagd; timeout 5 seconden, 1 retry na 30 seconden. Verwerk callbacks idempotent.\n",
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "$ref": "#/components/schemas/WorkbookRun"
+                      }
+                    }
+                  }
+                },
+                "responses": {
+                  "2XX": {
+                    "description": "Callback ontvangen."
+                  },
+                  "4XX": {
+                    "description": "Geldt als mislukte aflevering (net als 5XX of een timeout van 5 seconden); er volgt één retry na 30 seconden."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/workbooks/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "getWorkbookRunStatus",
+        "summary": "Get workbook run status",
+        "description": "Voortgang van één workbook-run. Velden met waarde `null` kunnen ontbreken; counts,\n`post_url` en `results_expire_at` zijn pas gevuld na een terminale status.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "description": "De run-ID uit de workbook-aanmaak.",
+            "schema": {
+              "$ref": "#/components/schemas/ObjectId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run-status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkbookRun"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/workbooks/{workbook_id}/run": {
+      "get": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "getLatestWorkbookRun",
+        "summary": "Get latest run of workbook (legacy)",
+        "deprecated": true,
+        "description": "Blijft beschikbaar voor compatibiliteit en geeft de laatste run van het workbook. Gebruik bij voorkeur `GET /workbooks/runs/{run_id}`.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkbookIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run-status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkbookRun"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/workbooks/schedules": {
+      "post": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "createWorkbookSchedule",
+        "summary": "Schedule a workbook run",
+        "description": "Plant een toekomstige workbook-extractie voor één post. `webhook_url` is verplicht.\nHet gedispatchte workbook verloopt 12 uur na dispatch.\nBij een bestaande `idempotency_key` in dezelfde workspace komt `200 OK` met het originele schedule terug.\n",
+        "x-rate-limit": "30/minute",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkbookScheduleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Replay met bestaande `idempotency_key`; origineel schedule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedWorkbookSchedule"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Schedule aangemaakt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedWorkbookSchedule"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        },
+        "callbacks": {
+          "runCompleted": {
+            "{$request.body#/webhook_url}": {
+              "post": {
+                "summary": "Scheduled workbook run completion callback",
+                "description": "Zelfde payload als bij directe workbook-runs, met `schedule_id` gevuld. Verwerk idempotent.",
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "$ref": "#/components/schemas/WorkbookRun"
+                      }
+                    }
+                  }
+                },
+                "responses": {
+                  "2XX": {
+                    "description": "Callback ontvangen."
+                  },
+                  "4XX": {
+                    "description": "Geldt als mislukte aflevering (net als 5XX of een timeout van 5 seconden); er volgt één retry na 30 seconden."
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "listWorkbookSchedules",
+        "summary": "List schedules",
+        "description": "Gepagineerde lijst van geplande workbook-runs in een workspace. Vraag pagina 1 op zonder\n`snapshot_time` en hergebruik de teruggegeven `snapshot_time` voor volgende pagina's.\n",
+        "x-rate-limit": "60/minute",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/WorkspaceIdQuery"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/ScheduleStatus"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Page"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotTime"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pagina met schedules.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaginatedSchedules"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/workbooks/schedules/{schedule_id}": {
+      "parameters": [
+        {
+          "name": "schedule_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ObjectId"
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "getWorkbookSchedule",
+        "summary": "Get schedule",
+        "description": "Eén geplande workbook-run; zelfde object als in de lijst-response.",
+        "x-rate-limit": "60/minute",
+        "responses": {
+          "200": {
+            "description": "Het schedule.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkbookSchedule"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Workbooks"
+        ],
+        "operationId": "cancelWorkbookSchedule",
+        "summary": "Cancel schedule",
+        "description": "Annuleren kan vóór dispatch. `scheduled` → `200` met status `cancelled`;\n`cancelled`/`failed` → `200` idempotent; `dispatching`/`dispatched` → `409 Conflict`.\n",
+        "x-rate-limit": "30/minute",
+        "responses": {
+          "200": {
+            "description": "Schedule geannuleerd (of was al geannuleerd/mislukt).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkbookSchedule"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Schedule wordt al gedispatcht of is gedispatcht.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleConflictError"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/tools/social-url-timestamp": {
+      "get": {
+        "tags": [
+          "Tools"
+        ],
+        "operationId": "getSocialUrlTimestamp",
+        "summary": "Social URL timestamp",
+        "description": "UTC-aanmaaktijd van een social media post, gedecodeerd uit de post-ID.",
+        "x-rate-limit": "500/minute",
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "description": "Een post/activity-URL (of numerieke activity-ID).",
+            "schema": {
+              "type": "string"
+            },
+            "example": "https://www.linkedin.com/posts/johndoe_activity-7349008612637241345"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Timestamp.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SocialUrlTimestamp"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Input kon niet geparset worden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "detail": "Input not valid: https://www.linkedin.com/in/johndoe"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/tools/parse-name": {
+      "get": {
+        "tags": [
+          "Tools"
+        ],
+        "operationId": "parseName",
+        "summary": "Parse name",
+        "description": "Splitst een volledige naam in voor- en achternaam (ook met prefixen, suffixen en meerdere delen).",
+        "x-rate-limit": "500/minute",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "John Doe"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Geparste naam.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParsedName"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      }
+    },
+    "parameters": {
+      "WorkspaceIdPath": {
+        "name": "workspace_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/ObjectId"
+        }
+      },
+      "WorkspaceIdQuery": {
+        "name": "workspace_id",
+        "in": "query",
+        "required": true,
+        "description": "Workspace-ID.",
+        "schema": {
+          "$ref": "#/components/schemas/ObjectId"
+        }
+      },
+      "SignalIdPath": {
+        "name": "signal_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/ObjectId"
+        }
+      },
+      "PostIdPath": {
+        "name": "post_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/ObjectId"
+        }
+      },
+      "WorkbookIdPath": {
+        "name": "workbook_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/ObjectId"
+        }
+      },
+      "Page": {
+        "name": "page",
+        "in": "query",
+        "description": "Paginanummer (1-indexed).",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "EngagerPageSize": {
+        "name": "page_size",
+        "in": "query",
+        "description": "Items per pagina.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100
+        }
+      },
+      "ContactPageSize": {
+        "name": "page_size",
+        "in": "query",
+        "description": "Items per pagina.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 500
+        }
+      },
+      "SnapshotTime": {
+        "name": "snapshot_time",
+        "in": "query",
+        "description": "ISO 8601-timestamp die stabiliseert welke records over pagina's heen bestaan.\nLaat weg op pagina 1 en hergebruik daarna de teruggegeven waarde.\nLet op: URL-encode een `+` als `%2B`.\n",
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "EngagementTypeFilter": {
+        "name": "engagement_type",
+        "in": "query",
+        "description": "Filter op type engagement.",
+        "schema": {
+          "$ref": "#/components/schemas/EngagementType"
+        }
+      },
+      "PostTimePeriod": {
+        "name": "post_time_period",
+        "in": "query",
+        "description": "Beperk tot engagements op posts uit de genoemde recente periode. Met 1 dag ingestion-buffer:\n`day` = 2 dagen, `week` = 8 dagen, `month` = 32 dagen, `three_months` = 91 dagen.\nWeglaten = volledige retentie van 180 dagen.\n",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "day",
+            "week",
+            "month",
+            "three_months"
+          ]
+        }
+      },
+      "ActivityFilter": {
+        "name": "activity_filter",
+        "in": "query",
+        "description": "Filter op activiteit: `commenters`, `reactors`, of komma-gescheiden combinatie.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "EmailStatusFilter": {
+        "name": "email_status",
+        "in": "query",
+        "description": "Filter op e-mailstatus, komma-gescheiden: `found`, `not_found`, `pending`. Ongeldige waarden geven 400.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Ongeldige parameters.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "Invalid workspace_id format"
+            }
+          }
+        }
+      },
+      "EngagersBadRequest": {
+        "description": "Ongeldige parameters, of signaltype zonder engagers.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "invalidSignalId": {
+                "value": {
+                  "detail": "invalid_signal_id_format"
+                }
+              },
+              "noEngagers": {
+                "value": {
+                  "detail": "signal_type_does_not_have_engagers"
+                }
+              },
+              "invalidEngagementType": {
+                "value": {
+                  "detail": "invalid_engagement_type"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Ongeldige of ontbrekende API key.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "Invalid or missing API key"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Geen toegang tot de resource.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "No access to workspace"
+            }
+          }
+        }
+      },
+      "SignalNotInWorkspace": {
+        "description": "Signal hoort niet bij je workspace.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "signal_not_in_workspace"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource bestaat niet.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "SignalNotFound": {
+        "description": "Signal niet gevonden.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "Signal not found"
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "description": "Validatiefout.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "Invalid post URL format"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Rate limit overschreden.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "detail": "Rate limit exceeded"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ObjectId": {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F]{24}$",
+        "description": "MongoDB ObjectId (24 hex-tekens).",
+        "example": "507f1f77bcf86cd799439011"
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "description": "Foutmelding; meestal een string, soms een gestructureerd object.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
+            ]
+          }
+        }
+      },
+      "ScheduleConflictError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "object",
+            "properties": {
+              "schedule_id": {
+                "$ref": "#/components/schemas/ObjectId"
+              },
+              "status": {
+                "$ref": "#/components/schemas/ScheduleStatus"
+              },
+              "run_id": {
+                "type": "string",
+                "nullable": true
+              },
+              "workbook_id": {
+                "type": "string",
+                "nullable": true
+              },
+              "message": {
+                "type": "string",
+                "example": "schedule_in_status_dispatched"
+              }
+            }
+          }
+        }
+      },
+      "WorkspaceMembership": {
+        "type": "object",
+        "properties": {
+          "membership_id": {
+            "type": "string",
+            "description": "Lidmaatschaps-ID van de gebruiker in deze workspace."
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "workspace_name": {
+            "type": "string"
+          },
+          "user_role": {
+            "type": "string",
+            "description": "Jouw rol in de workspace.",
+            "example": "owner"
+          }
+        }
+      },
+      "Subscription": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "plan": {
+            "type": "string",
+            "example": "pro"
+          },
+          "credits_limit": {
+            "type": "number",
+            "example": 5000.0
+          },
+          "credits_used": {
+            "type": "number",
+            "example": 1500.0
+          },
+          "credits_remaining": {
+            "type": "number",
+            "example": 3500.0
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "max_signal_count": {
+            "type": "integer",
+            "description": "Maximaal aantal actieve signals.",
+            "example": 10
+          },
+          "max_team_size": {
+            "type": "integer",
+            "description": "Maximaal aantal teamleden.",
+            "example": 5
+          }
+        }
+      },
+      "QueryType": {
+        "type": "string",
+        "enum": [
+          "search_keyword",
+          "user_profile",
+          "company_profile"
+        ]
+      },
+      "EngagementType": {
+        "type": "string",
+        "enum": [
+          "COMMENT",
+          "REACTION"
+        ]
+      },
+      "Signal": {
+        "type": "object",
+        "description": "Velden met waarde `null` worden weggelaten.",
+        "required": [
+          "_id",
+          "name",
+          "query",
+          "frequency",
+          "is_activated",
+          "query_type",
+          "track_engagement",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "name": {
+            "type": "string",
+            "example": "Brand Mentions"
+          },
+          "query": {
+            "type": "string",
+            "description": "Keywords, profiel-URL of bedrijfs-URL.",
+            "example": "lemlist OR \"heyreach\""
+          },
+          "frequency": {
+            "type": "integer",
+            "description": "Runfrequentie in uren.",
+            "default": 24
+          },
+          "is_activated": {
+            "type": "boolean"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Custom AI-filterprompt (alleen keyword-signals, indien ingesteld)."
+          },
+          "query_type": {
+            "$ref": "#/components/schemas/QueryType"
+          },
+          "query_identifier": {
+            "type": "string",
+            "description": "Gebruikersnaam of bedrijfs-ID uit de URL (alleen profile/company)."
+          },
+          "track_engagement": {
+            "type": "boolean",
+            "description": "Of engagers worden vastgelegd (`false` = alleen posts)."
+          },
+          "engagement_type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EngagementType"
+              }
+            ],
+            "description": "Alleen profile/company als één type is gekozen; weggelaten bij beide."
+          },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS-URL voor run-completion callbacks."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreatedSignal": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Signal"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "run": {
+                "type": "object",
+                "properties": {
+                  "run_id": {
+                    "$ref": "#/components/schemas/ObjectId"
+                  },
+                  "status": {
+                    "$ref": "#/components/schemas/SignalRunStatus"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "CreateSignalRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "name",
+          "query"
+        ],
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 69
+          },
+          "query": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 300,
+            "description": "Keywords, profiel-URL of bedrijfs-URL; bepaalt `query_type`."
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 3000,
+            "description": "Optionele AI-filterprompt voor keyword-signals. Genegeerd bij profile/company."
+          },
+          "prompt_name": {
+            "type": "string",
+            "description": "Weergavenaam van de prompt (default \"AI filter\"). Write-only."
+          },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 1000,
+            "description": "HTTPS-URL voor run-completion callbacks."
+          },
+          "initial_window": {
+            "type": "string",
+            "enum": [
+              "past_month",
+              "past_week",
+              "none"
+            ],
+            "default": "past_month",
+            "description": "Backfill-venster van de eerste run (alleen profile/company). Write-only. Niet-default waarden worden geweigerd bij keyword-signals."
+          },
+          "track_engagement": {
+            "type": "boolean",
+            "default": true,
+            "description": "Engagers vastleggen voor profile/company-signals. Geweigerd bij keyword-signals."
+          },
+          "engagement_type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EngagementType"
+              }
+            ],
+            "description": "Alleen `COMMENT` of `REACTION` vastleggen (profile/company). Weglaten = beide. Geweigerd bij keyword-signals."
+          }
+        }
+      },
+      "SignalRunStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "pending",
+          "running",
+          "success",
+          "success_with_warnings",
+          "failed",
+          "timed_out",
+          "cancelled"
+        ]
+      },
+      "SignalRun": {
+        "type": "object",
+        "required": [
+          "signal_id",
+          "run_id",
+          "status"
+        ],
+        "properties": {
+          "signal_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SignalRunStatus"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Aanwezig na start."
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Aanwezig na afronding."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "description": "Aanwezig na afronding."
+          },
+          "error": {
+            "type": "string",
+            "description": "Foutmelding bij mislukking."
+          }
+        }
+      },
+      "EmailStatus": {
+        "type": "string",
+        "enum": [
+          "found",
+          "not_found",
+          "pending"
+        ],
+        "description": "`found` = e-mail gevonden; `not_found` = terminaal, geen e-mail;\n`pending` = verrijking loopt nog (tijdelijk).\n"
+      },
+      "RoleLevel": {
+        "type": "string",
+        "nullable": true,
+        "description": "Authority — de rang die de functietitel claimt. `out_of_scope` wordt alleen teruggegeven, niet gefilterd.",
+        "enum": [
+          "executive",
+          "vp",
+          "director",
+          "manager",
+          "principal",
+          "senior_ic",
+          "ic",
+          "junior",
+          "unranked",
+          "out_of_scope",
+          null
+        ]
+      },
+      "EmploymentContext": {
+        "type": "string",
+        "nullable": true,
+        "enum": [
+          "in_house",
+          "founder_owner",
+          "fractional",
+          "interim",
+          "advisory",
+          "freelance",
+          null
+        ]
+      },
+      "JobFunction": {
+        "type": "string",
+        "nullable": true,
+        "enum": [
+          "ENG",
+          "PRD",
+          "MKT",
+          "SAL",
+          "FIN",
+          "OPS",
+          "HR",
+          "CS",
+          "LEG",
+          "DA",
+          "DSN",
+          "EDU",
+          "AMB",
+          "GEN",
+          "UNMAPPED",
+          null
+        ]
+      },
+      "CompanySize": {
+        "type": "string",
+        "nullable": true,
+        "enum": [
+          "XXS",
+          "XS",
+          "S",
+          "M",
+          "L",
+          "XL",
+          "XXL",
+          "UNMAPPED",
+          null
+        ]
+      },
+      "CompanyIndustry": {
+        "type": "string",
+        "nullable": true,
+        "description": "Industriecode.",
+        "enum": [
+          "TECH_INFO_MEDIA",
+          "FINANCIAL_SERVICES",
+          "HEALTH_CARE",
+          "PROFESSIONAL_SERVICES",
+          "MANUFACTURING",
+          "RETAIL",
+          "EDUCATION",
+          "CONSTRUCTION",
+          "CONSUMER_SERVICES",
+          "ENTERTAINMENT",
+          "TRANSPORTATION_LOGISTICS",
+          "ACCOMMODATION_SERVICES",
+          "ADMINISTRATIVE_SERVICES",
+          "FARMING_RANCHING_FORESTRY",
+          "GOV_ADMIN",
+          "HOLDING_COMPANIES",
+          "OIL_GAS_MINING",
+          "REAL_ESTATE_EQUIPMENT",
+          "UTILITIES",
+          "WHOLESALE",
+          "UNMAPPED",
+          null
+        ]
+      },
+      "PostAuthor": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "profile_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "profile_image_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "description": {
+            "type": "string",
+            "description": "Headline."
+          },
+          "username": {
+            "type": "string"
+          },
+          "profile_type": {
+            "type": "string",
+            "enum": [
+              "user",
+              "company"
+            ]
+          },
+          "country_code": {
+            "type": "string",
+            "example": "US"
+          },
+          "country": {
+            "type": "string",
+            "example": "United States"
+          },
+          "role_level": {
+            "$ref": "#/components/schemas/RoleLevel"
+          },
+          "employment_context": {
+            "$ref": "#/components/schemas/EmploymentContext"
+          },
+          "function": {
+            "$ref": "#/components/schemas/JobFunction"
+          },
+          "company_size": {
+            "$ref": "#/components/schemas/CompanySize"
+          },
+          "company_industry": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_website": {
+            "type": "string",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "email_status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          }
+        }
+      },
+      "EmbeddedContent": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "type": {
+            "type": "string",
+            "example": "article"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "title": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "image_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "thumbnail_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "PostClassification": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "lang": {
+            "type": "string",
+            "example": "en"
+          },
+          "sentiment": {
+            "type": "string",
+            "enum": [
+              "positive",
+              "negative",
+              "neutral"
+            ]
+          },
+          "weight": {
+            "type": "number",
+            "example": 0.85
+          }
+        }
+      },
+      "Post": {
+        "type": "object",
+        "properties": {
+          "_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "urn": {
+            "type": "string",
+            "example": "urn:li:activity:7349008612637241345"
+          },
+          "content": {
+            "type": "string"
+          },
+          "author": {
+            "$ref": "#/components/schemas/PostAuthor"
+          },
+          "posted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Publicatiemoment online."
+          },
+          "reaction_count": {
+            "type": "integer"
+          },
+          "comment_count": {
+            "type": "integer"
+          },
+          "embedded_content": {
+            "$ref": "#/components/schemas/EmbeddedContent"
+          },
+          "search_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "classification": {
+            "$ref": "#/components/schemas/PostClassification"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Moment waarop Jungler de post vastlegde."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_engagement_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "Moment waarop Jungler het laatst een nieuwe engager vastlegde (capture-tijd, niet `engaged_at`)."
+          }
+        }
+      },
+      "Pagination": {
+        "type": "object",
+        "required": [
+          "total",
+          "page",
+          "page_size",
+          "pages",
+          "snapshot_time"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "description": "Totaal aantal matchende items."
+          },
+          "page": {
+            "type": "integer"
+          },
+          "page_size": {
+            "type": "integer"
+          },
+          "pages": {
+            "type": "integer"
+          },
+          "snapshot_time": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PaginatedPosts": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Post"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "EngagerAuthor": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "urn": {
+            "type": "string",
+            "nullable": true,
+            "example": "urn:li:member:789"
+          },
+          "username": {
+            "type": "string",
+            "nullable": true
+          },
+          "profile_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "profile_image_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "description": "Headline/titel."
+          },
+          "profile_type": {
+            "type": "string",
+            "enum": [
+              "user",
+              "company"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_website": {
+            "type": "string",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          },
+          "email_status": {
+            "$ref": "#/components/schemas/EmailStatus"
+          },
+          "title": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_icon_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "loc_country": {
+            "type": "string",
+            "nullable": true
+          },
+          "loc_region": {
+            "type": "string",
+            "nullable": true,
+            "description": "Regio (NA, EU, AP)."
+          },
+          "loc_code": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-landcode."
+          },
+          "loc_city": {
+            "type": "string",
+            "nullable": true
+          },
+          "loc_state": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_size": {
+            "$ref": "#/components/schemas/CompanySize"
+          },
+          "company_industry": {
+            "$ref": "#/components/schemas/CompanyIndustry"
+          },
+          "company_hq_loc_country": {
+            "type": "string",
+            "nullable": true
+          },
+          "company_hq_loc_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "role_level": {
+            "$ref": "#/components/schemas/RoleLevel"
+          },
+          "employment_context": {
+            "$ref": "#/components/schemas/EmploymentContext"
+          },
+          "function": {
+            "$ref": "#/components/schemas/JobFunction"
+          }
+        }
+      },
+      "CommentMeta": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "is_reply": {
+            "type": "boolean"
+          },
+          "replies": {
+            "type": "integer"
+          },
+          "is_pinned": {
+            "type": "boolean"
+          },
+          "is_edited": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Engager": {
+        "type": "object",
+        "properties": {
+          "engagement_type": {
+            "$ref": "#/components/schemas/EngagementType"
+          },
+          "urn": {
+            "type": "string",
+            "description": "Engagement-URN (dedup-sleutel)."
+          },
+          "post_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "jungler_post_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "author": {
+            "$ref": "#/components/schemas/EngagerAuthor"
+          },
+          "content": {
+            "type": "string",
+            "nullable": true,
+            "description": "Commenttekst (null bij reactions)."
+          },
+          "comment_meta": {
+            "$ref": "#/components/schemas/CommentMeta"
+          },
+          "reaction_type": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "LIKE",
+              "APPRECIATION",
+              "EMPATHY",
+              "INTEREST",
+              "PRAISE",
+              "ENTERTAINMENT",
+              null
+            ]
+          },
+          "engaged_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Contact": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/EngagerAuthor"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "stats": {
+                "type": "object",
+                "description": "Engagement-tellingen (geschaald naar `post_time_period` indien gezet).",
+                "properties": {
+                  "comments": {
+                    "type": "integer"
+                  },
+                  "reactions": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "last_engaged_at": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              }
+            }
+          }
+        ]
+      },
+      "PaginatedEngagers": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Engager"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "PaginatedContacts": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "DataTypes": {
+        "type": "array",
+        "minItems": 1,
+        "description": "Te extraheren datatypes (hoofdletterongevoelig; postdata zit er altijd bij).",
+        "items": {
+          "type": "string",
+          "enum": [
+            "comment",
+            "reaction"
+          ]
+        },
+        "example": [
+          "comment",
+          "reaction"
+        ]
+      },
+      "CreateWorkbookRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "post_url",
+          "data_types"
+        ],
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "post_url": {
+            "type": "string",
+            "format": "uri",
+            "example": "https://www.linkedin.com/feed/update/urn:li:activity:1234567890"
+          },
+          "data_types": {
+            "$ref": "#/components/schemas/DataTypes"
+          },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 1000,
+            "description": "HTTPS-URL die wordt aangeroepen als de run klaar is."
+          }
+        }
+      },
+      "WorkbookRunStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "success",
+          "success_credits_exhausted",
+          "failed"
+        ]
+      },
+      "CreatedWorkbookRun": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkbookRunStatus"
+          },
+          "workbook_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          }
+        }
+      },
+      "WorkbookRun": {
+        "type": "object",
+        "description": "Run-status en ook payload van de completion-webhook. Velden met `null` kunnen ontbreken bij polling.",
+        "properties": {
+          "schedule_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Gevuld bij geplande runs, `null` bij directe runs."
+          },
+          "workbook_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "run_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkbookRunStatus"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "duration_ms": {
+            "type": "integer",
+            "nullable": true
+          },
+          "post_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "post_urn": {
+            "type": "string"
+          },
+          "items_collected": {
+            "type": "integer"
+          },
+          "items_available": {
+            "type": "integer"
+          },
+          "credits_consumed": {
+            "type": "number"
+          },
+          "credits_exhausted": {
+            "type": "boolean"
+          },
+          "counts": {
+            "type": "object",
+            "properties": {
+              "posts": {
+                "type": "integer"
+              },
+              "comments": {
+                "type": "integer"
+              },
+              "reactions": {
+                "type": "integer"
+              },
+              "raw_engagements": {
+                "type": "integer"
+              },
+              "unique_contacts": {
+                "type": "integer"
+              }
+            }
+          },
+          "results_expire_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ScheduleStatus": {
+        "type": "string",
+        "enum": [
+          "scheduled",
+          "dispatching",
+          "dispatched",
+          "cancelled",
+          "failed"
+        ]
+      },
+      "CreateWorkbookScheduleRequest": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "post_url",
+          "data_types",
+          "scheduled_at",
+          "webhook_url"
+        ],
+        "properties": {
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "post_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "data_types": {
+            "$ref": "#/components/schemas/DataTypes"
+          },
+          "scheduled_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC. Minimaal 60 seconden in de toekomst en maximaal 30 dagen vooruit."
+          },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 1000
+          },
+          "idempotency_key": {
+            "type": "string",
+            "description": "Sleutel per workspace; replays geven het originele schedule terug."
+          }
+        }
+      },
+      "CreatedWorkbookSchedule": {
+        "type": "object",
+        "properties": {
+          "schedule_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScheduleStatus"
+          },
+          "scheduled_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "dispatcher_pickup_window": {
+            "type": "object",
+            "description": "Verwacht oppakvenster van de scheduler (best-effort).",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        }
+      },
+      "WorkbookSchedule": {
+        "type": "object",
+        "properties": {
+          "schedule_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/ObjectId"
+          },
+          "post_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "post_urn": {
+            "type": "string"
+          },
+          "data_types": {
+            "$ref": "#/components/schemas/DataTypes"
+          },
+          "webhook_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "scheduled_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScheduleStatus"
+          },
+          "workbook_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "run_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatching_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "error_message": {
+            "type": "string",
+            "nullable": true
+          },
+          "idempotency_key": {
+            "type": "string",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PaginatedSchedules": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Pagination"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WorkbookSchedule"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "SocialUrlTimestamp": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "7349008612637241345"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2025-07-10T09:36:31.230000Z"
+          },
+          "unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "example": 1752140191230
+          }
+        }
+      },
+      "ParsedName": {
+        "type": "object",
+        "properties": {
+          "first_name": {
+            "type": "string",
+            "example": "John"
+          },
+          "last_name": {
+            "type": "string",
+            "example": "Doe"
+          }
+        }
+      }
+    }
+  }
+}
