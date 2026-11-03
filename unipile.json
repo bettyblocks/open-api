@@ -1,16 +1,23 @@
 {
   "openapi": "3.1.0",
   "info": {
+    "title": "Unipile API",
     "version": "1.0.0",
-    "title": ""
+    "description": "Unipile API v2. Alle requests verlopen via HTTPS op https://api.unipile.com (paden beginnen met /v2). Authenticeer elk request met de X-API-KEY header. Gebruik een API key van dezelfde Application als het account dat je aanspreekt."
   },
+  "servers": [
+    {
+      "url": "https://api.unipile.com",
+      "description": "Unipile API (v2)"
+    }
+  ],
   "components": {
     "securitySchemes": {
       "ApiKeyAuth": {
         "type": "apiKey",
         "in": "header",
         "name": "X-API-KEY",
-        "description": "Voer hier je Unipile API key in"
+        "description": "Voer hier je Unipile API key in. Gebruik een key die bij dezelfde Application hoort als het account dat je aanspreekt."
       }
     },
     "schemas": {}
